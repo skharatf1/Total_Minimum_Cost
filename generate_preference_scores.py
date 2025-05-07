@@ -43,13 +43,25 @@ def generate_preference_scores():
                 else:
                     emp_scores[plan_name] += 5
         
-        # Add results to the list
-        for plan_name, score in emp_scores.items():
-            results.append({
-                'Employee Name': employee_name,
-                'Plan ID': plan_name,
-                'Preference Score': score
-            })
+        # Normalize scores for this employee
+        if emp_scores:
+            min_score = min(emp_scores.values())
+            max_score = max(emp_scores.values())
+            if max_score > min_score:
+                normalized_scores = {
+                    plan: (score - min_score) / (max_score - min_score)
+                    for plan, score in emp_scores.items()
+                }
+            else:
+                normalized_scores = {plan: 1.0 for plan in emp_scores}
+            
+            # Add normalized results to the list
+            for plan_name, score in normalized_scores.items():
+                results.append({
+                    'Employee Name': employee_name,
+                    'Plan ID': plan_name,
+                    'Preference Score': score
+                })
     
     # Convert results to DataFrame
     result_df = pd.DataFrame(results)
@@ -57,8 +69,8 @@ def generate_preference_scores():
     # Sort by Employee Name and Preference Score (descending)
     result_df = result_df.sort_values(['Employee Name', 'Preference Score'], ascending=[True, False])
     
-    # Save to CSV in user's home directory
-    output_path = os.path.expanduser('~/preference_scores.csv')
+    # Save to CSV in current directory
+    output_path = 'preference_scores.csv'
     result_df.to_csv(output_path, index=False)
     print(f"Preference scores have been generated and saved to '{output_path}'")
     

@@ -1,146 +1,172 @@
 import pandas as pd
-from pulp import LpProblem, LpMinimize, LpVariable, lpSum, value
+from pulp import LpProblem, LpMinimize, LpVariable, lpSum, value, LpBinary, LpContinuous
 
 # Load data
 employees_df = pd.read_csv('employees.csv')
-preferences_df = pd.read_csv('preference_scores.csv')
+prefs_df = pd.read_csv('preference_scores.csv')
 
-# Preprocess employees
-employees = employees_df[['employeeId', 'firstName', 'lastName', 'composition']].copy()
-employees['employeeId'] = employees['employeeId'].astype(str)
-
-# Map full names to employee IDs for easier matching
-name_to_id = {
-    f"{row['firstName']} {row['lastName']}": row['employeeId']
-    for _, row in employees.iterrows()
-}
-
-# Extract plans and premiums per employee
-plan_columns = ['plan_level_id1', 'plan_level_id2', 'plan_level_id3', 'plan_level_id4', 'plan_level_id5', 'hsa_eligible_plan']
+# Extract all available plans
+plan_columns = ['plan_level_id1', 'plan_level_id2', 'plan_level_id3',
+                'plan_level_id4', 'plan_level_id5', 'hsa_eligible_plan']
 premium_columns = [col + '_premium' for col in plan_columns]
 
-# Create dictionary of available plans and their premiums for each employee
-employee_plans = []
+all_plans = set()
+for col in plan_columns:
+    all_plans.update(employees_df[col].dropna().unique())
+all_plans = list(all_plans)
+
+# Coverage types
+coverage_types = ["Employee Only", "Employee + Spouse", "Employee + Family"]
+
+# Map employees to their available plans, premiums, and preference scores
+employee_data = []
+
 for _, row in employees_df.iterrows():
+    name = f"{row['firstName']} {row['lastName']}"
+    coverage = row['composition']
     emp_plans = {}
+    emp_prefs = {}
+
+    # Get all plans and premiums
     for plan_col, premium_col in zip(plan_columns, premium_columns):
         plan_id = row[plan_col]
-        if pd.notna(plan_id):
-            premium = row[premium_col]
-            emp_plans[str(plan_id)] = float(premium)
-    employee_plans.append(emp_plans)
+        if pd.isna(plan_id):
+            continue
+        premium = row[premium_col]
+        if pd.notna(premium):
+            emp_plans[plan_id] = float(premium)
 
-# Build all unique plans
-all_plans = set()
-for ep in employee_plans:
-    all_plans.update(ep.keys())
-all_plans = list(all_plans)
-plan_indices = {plan: idx for idx, plan in enumerate(all_plans)}
-num_employees = len(employees_df)
-num_plans = len(all_plans)
+    # Get preference scores from preference_scores.csv
+    pref_rows = prefs_df[prefs_df['Employee Name'] == name]
+    for _, p_row in pref_rows.iterrows():
+        plan_id = p_row['Plan ID']
+        score = p_row['Preference Score']
+        emp_prefs[plan_id] = score
 
-# Preference dictionary
-pref_dict = preferences_df.set_index(['Employee Name', 'Plan ID'])['Preference Score'].to_dict()
+    employee_data.append({
+        'name': name,
+        'coverage': coverage,
+        'plans': emp_plans,
+        'prefs': emp_prefs
+    })
 
-# Decision variables
-# Create variables for each employee-plan combination
-x = {}
+# Create LP Problem
+prob = LpProblem("Health_Plan_Selection", LpMinimize)
+
+# Decision Variables
+num_employees = len(employee_data)
+x = [[LpVariable(f"x_{i}_{j}", cat=LpBinary) for j in range(len(all_plans))] for i in range(num_employees)]
+
+# y[j]: Whether plan j is used
+y = [LpVariable(f"y_{j}", cat=LpBinary) for j in range(len(all_plans))]
+
+# Contribution factors per coverage type
+contrib_vars = {
+    ct: LpVariable(f"contrib_{ct.replace(' ', '_')}", lowBound=0.1, upBound=1.0, cat=LpContinuous)
+    for ct in coverage_types
+}
+
+# Calculate normalization factors
+max_cost = sum(sum(emp['plans'].values()) for emp in employee_data)
+max_pref = sum(sum(emp['prefs'].values()) for emp in employee_data if emp['prefs'])
+norm_factor = max(max_cost, max_pref) if max_cost and max_pref else 1
+
+print(f"Normalization factor: {norm_factor}")
+
+# Auxiliary variable for cost: z[i][j] = contrib * premium * x[i][j]
+z = {}
+cost_terms = []
+pref_terms = []
+
 for i in range(num_employees):
-    for plan in employee_plans[i]:
-        x[(i, plan)] = LpVariable(f"x_{i}_{plan}", cat="Binary")
+    emp = employee_data[i]
+    coverage = emp['coverage']
+    contrib = contrib_vars[coverage]
 
-# Contribution factors (as constants)
-c1 = 0.8  # Employee Only
-c2 = 0.7  # Employee + Spouse
-c3 = 0.6  # Employee + Family
+    for j, plan in enumerate(all_plans):
+        if plan not in emp['plans']:
+            prob += x[i][j] == 0
+            continue
 
-# Objective function: minimize total company cost
-problem = LpProblem("Health_Plan_Assignment", LpMinimize)
+        premium = emp['plans'][plan]
+        pref = emp['prefs'].get(plan, 0)
 
-# Total cost expression
-total_cost_expr = lpSum(
-    employee_plans[i][plan] * x[(i, plan)] * (
-        c1 if employees.iloc[i]['composition'] == 'Employee Only' else
-        c2 if employees.iloc[i]['composition'] == 'Employee + Spouse' else
-        c3
-    )
-    for i in range(num_employees)
-    for plan in employee_plans[i]
-)
+        # Create auxiliary variable for cost
+        z[(i, j)] = LpVariable(f"z_{i}_{j}", lowBound=0)
 
-# Preference score expression
-total_preference_expr = lpSum(
-    pref_dict.get((f"{employees.iloc[i]['firstName']} {employees.iloc[i]['lastName']}", plan), 0) * x[(i, plan)]
-    for i in range(num_employees)
-    for plan in employee_plans[i]
-)
+        # Enforce z == contrib * premium * x[i][j] using Big-M method
+        M = premium  # Big-M value based on max possible premium
+        prob += z[(i, j)] <= premium * contrib, f"z_ub1_{i}_{j}"
+        prob += z[(i, j)] <= M * x[i][j], f"z_ub2_{i}_{j}"
+        prob += z[(i, j)] >= premium * contrib - M * (1 - x[i][j]), f"z_lb_{i}_{j}"
+        prob += z[(i, j)] >= 0, f"z_pos_{i}_{j}"
 
-# Combine into single objective with weights
-weight_cost = 1.0
-weight_pref = -0.001  # Adjust this to balance between cost and preference
+        # Add terms to objective
+        cost_terms.append(z[(i, j)])
+        pref_terms.append(pref * x[i][j])
 
-problem += weight_cost * total_cost_expr + weight_pref * total_preference_expr, "MultiObjective"
+# Objective: minimize cost - preference
+alpha = 0.5  # weight on cost
+beta = 0.5   # weight on preference
+prob += (alpha * lpSum(cost_terms) / norm_factor) - (beta * lpSum(pref_terms) / norm_factor)
 
 # Constraints
 
-# 1. Each employee must be assigned exactly one plan
+# Each employee gets exactly one plan
 for i in range(num_employees):
-    problem += lpSum(
-        x[(i, plan)]
-        for plan in employee_plans[i]
-    ) == 1, f"One_Plan_Employee_{i}"
+    prob += lpSum(x[i]) == 1, f"one_plan_{i}"
 
-# 2. Employees can only be assigned available plans
-for i in range(num_employees):
-    for plan in all_plans:
-        if plan not in employee_plans[i]:
-            if (i, plan) in x:
-                problem += x[(i, plan)] == 0, f"No_Plan_{i}_{plan}"
+# Link y[j] with x[i][j]
+for j in range(len(all_plans)):
+    for i in range(num_employees):
+        prob += x[i][j] <= y[j], f"link_{i}_{j}"
 
-# Solve the problem
-print("Solving optimization...")
-status = problem.solve()
-print(f"Status: {status}")
+# Max 5 unique plans
+prob += lpSum(y) <= 5, "max_plans"
 
-# Output results
-assignments = []
-total_company_cost = 0
-for i in range(num_employees):
-    emp_name = f"{employees.iloc[i]['firstName']} {employees.iloc[i]['lastName']}"
-    comp = employees.iloc[i]['composition']
-    
-    for plan in employee_plans[i]:
-        if value(x[(i, plan)]) > 0.5:
-            contrib_factor = (
-                c1 if comp == 'Employee Only' else
-                c2 if comp == 'Employee + Spouse' else
-                c3
-            )
-            premium = employee_plans[i][plan]
-            total_company_cost += premium * contrib_factor
-            assignments.append({
-                'Employee Name': emp_name,
-                'Composition': comp,
-                'PlanID': plan,
-                'Contribution Factor': round(contrib_factor, 2),
-                'Premium': premium
-            })
-            break
+# At least one HSA-eligible plan must be selected
+hsa_plans = employees_df['hsa_eligible_plan'].dropna().unique()
+if len(hsa_plans) > 0:
+    hsa_plan_indices = [all_plans.index(p) for p in hsa_plans if p in all_plans]
+    if hsa_plan_indices:
+        prob += lpSum(y[j] for j in hsa_plan_indices) >= 1, "hsa_requirement"
 
-# Group by composition to get average contribution
-contrib_summary = pd.DataFrame(assignments)[['Composition', 'Contribution Factor']]
-contrib_summary = contrib_summary.groupby('Composition').mean().reset_index()
+# Solve model
+print("\nSolving optimization problem...")
+status = prob.solve()
 
-# Final output
-print("\nEmployer Contribution in %")
-print("----------------------------")
-print(contrib_summary.to_string(index=False))
+if status != 1:
+    print("❌ Problem is infeasible or solver failed.")
+else:
+    print("\n✅ Solution found!")
 
-print("\n\nEmployee Assignments")
-print("--------------------")
-assign_df = pd.DataFrame(assignments)
-print(assign_df[['Employee Name', 'PlanID', 'Contribution Factor', 'Premium']].to_string(index=False))
+    # Output Results
+    contrib_output = {ct: round(value(contrib_vars[ct]) * 100, 1) for ct in coverage_types}
 
-print("\n\nTotal Cost for Company")
-print("----------------------")
-print(f"${total_company_cost:.2f}")
+    print("\nEmployer Contribution Percentages:")
+    for ct in coverage_types:
+        print(f"{ct:<20} : {contrib_output[ct]}%")
+
+    print("\nEmployee Assignments:")
+    print("Employee Name         Plan ID           Premium       Contribution")
+    print("-" * 70)
+
+    total_cost = 0
+    for i in range(num_employees):
+        emp = employee_data[i]
+        for j in range(len(all_plans)):
+            if value(x[i][j]) > 0.5:
+                plan = all_plans[j]
+                coverage = emp['coverage']
+                contrib_percent = contrib_output[coverage]
+                premium = emp['plans'][plan]
+                cost = premium * contrib_percent / 100
+                total_cost += cost
+                print(f"{emp['name']:<20} {plan:<15} ${premium:>8.2f}     {contrib_percent:>5.1f}%")
+
+    print(f"\nTotal Cost for Company: ${total_cost:.2f}")
+
+    print("\nSelected Plans:")
+    for j in range(len(all_plans)):
+        if value(y[j]) > 0.5:
+            print(f"- {all_plans[j]}")
